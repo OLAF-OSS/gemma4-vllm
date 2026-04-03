@@ -24,7 +24,7 @@ case "$GEMMA_VARIANT" in
     TENSOR_PARALLEL=2
     QUANTIZATION_ARGS=()
     MAX_MODEL_LEN=262144
-    EXTRA_ARGS=()
+    EXTRA_ARGS=(--reasoning-parser gemma4 --default-chat-template-kwargs '{"enable_thinking": true}')
     SHM_SIZE="16g"
     ;;
   31b)
@@ -34,7 +34,7 @@ case "$GEMMA_VARIANT" in
     TENSOR_PARALLEL=4
     QUANTIZATION_ARGS=()
     MAX_MODEL_LEN=262144
-    EXTRA_ARGS=()
+    EXTRA_ARGS=(--reasoning-parser gemma4 --default-chat-template-kwargs '{"enable_thinking": true}')
     SHM_SIZE="16g"
     ;;
   *)
@@ -258,7 +258,8 @@ cmd_test() {
       \"model\": \"$SERVED_NAME\",
       \"messages\": [{\"role\": \"user\", \"content\": \"What is the weather in Paris?\"}],
       \"tools\": [{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Get weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]}}}],
-      \"tool_choice\": \"auto\"
+      \"tool_choice\": \"auto\",
+      \"skip_special_tokens\": false
     }")
 
   if echo "$response" | python3 -c "import sys,json; d=json.load(sys.stdin); tc=d['choices'][0]['message']['tool_calls'][0]; print(f\"Tool: {tc['function']['name']}\nArgs: {tc['function']['arguments']}\")" 2>/dev/null; then
@@ -267,6 +268,17 @@ cmd_test() {
     red "Tool calling failed"
     echo "$response" | python3 -m json.tool 2>/dev/null || echo "$response"
     exit 1
+  fi
+
+  # Check reasoning (26b/31b only)
+  if [ "$GEMMA_VARIANT" != "e2b" ]; then
+    local reasoning
+    reasoning=$(echo "$response" | python3 -c "import sys,json; m=json.load(sys.stdin)['choices'][0]['message']; print(m.get('reasoning') or '')" 2>/dev/null)
+    if [ -n "$reasoning" ]; then
+      green "Reasoning works"
+    else
+      yellow "Reasoning: not present in response"
+    fi
   fi
 }
 
