@@ -1,21 +1,16 @@
-# Gemma 4 E2B with vLLM + Tool Calling
+# Gemma 4 with vLLM + Tool Calling
 
-Serve Google's Gemma 4 E2B (5.1B params, 2.3B effective) with OpenAI-compatible tool calling on consumer GPUs.
+Serve Google's Gemma 4 models with OpenAI-compatible tool calling. Supports three variants — from a single consumer GPU up to multi-GPU tensor-parallel setups.
 
-Tested on NVIDIA RTX 3080 Ti (12GB VRAM) using 4-bit bitsandbytes quantization.
+## Models
 
-## Model
+| Variant | Model | Params | GPUs | Context | Quantization |
+|---------|-------|--------|------|---------|--------------|
+| `e2b` | [gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it) | 5.1B (2.3B effective) | 1 | 8K | bitsandbytes 4-bit |
+| `26b` | [gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) | 26B MoE (4B active) | 2 (tensor parallel) | 256K | none (BF16) |
+| `31b` | [gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) | 31B dense | 4 (tensor parallel) | 256K | none (BF16) |
 
-| | |
-|---|---|
-| Model | [google/gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it) |
-| Architecture | Dense + PLE (Per-Layer Embeddings) |
-| Parameters | 5.1B total, 2.3B effective |
-| Context | 128K native, 8K configured (VRAM constraint) |
-| Modalities | Text, Image, Audio, Video |
-| License | Apache 2.0 |
-| Quantization | bitsandbytes 4-bit (~3GB weights) |
-| VRAM usage | ~7.2GB model + ~2.1GB KV cache |
+All models share: Apache 2.0 license, multimodal input (text, image, video), tool calling support via vLLM's `gemma4` parser.
 
 ## Quick Start (bare metal)
 
@@ -23,7 +18,7 @@ Tested on NVIDIA RTX 3080 Ti (12GB VRAM) using 4-bit bitsandbytes quantization.
 # Install dependencies
 uv sync
 
-# Serve (downloads model on first run)
+# Serve E2B (downloads model on first run)
 ./serve.sh
 
 # Test tool calling
@@ -66,43 +61,47 @@ podman compose -f podman-compose.yml up --build
 
 ### Podman Pod (service script)
 
-`service.sh` manages the full pod lifecycle:
+`service.sh` manages the full pod lifecycle. Set `GEMMA_VARIANT` to choose the model (`e2b`, `26b`, or `31b`):
 
 ```bash
-# Build the image
+# Build the image (shared across all variants)
 ./service.sh build
 
-# Download model
-uv run python download-model.py
+# --- Run the 31B model (most powerful, 4 GPUs) ---
+GEMMA_VARIANT=31b ./service.sh download
+GEMMA_VARIANT=31b GPUS=0,1,2,3 ./service.sh up
+GEMMA_VARIANT=31b ./service.sh status
+GEMMA_VARIANT=31b ./service.sh test
 
-# Start (creates pod, waits for health check)
-./service.sh up
+# --- Run 26B alongside 31B on the remaining GPUs ---
+GEMMA_VARIANT=26b ./service.sh download
+GEMMA_VARIANT=26b GPUS=4,5 PORT=8001 ./service.sh up
 
-# Check status, health, and GPU usage
-./service.sh status
-
-# Run a tool calling smoke test
-./service.sh test
+# --- Run E2B (default, single GPU) ---
+./service.sh download
+GPUS=5 PORT=8002 ./service.sh up
 
 # View logs (supports extra args like -f, --tail, --since)
-./service.sh logs
-./service.sh logs -f --tail 100
+GEMMA_VARIANT=31b ./service.sh logs
+GEMMA_VARIANT=31b ./service.sh logs -f --tail 100
 
 # Stop / start / full restart
-./service.sh down
-./service.sh up
-./service.sh restart
+GEMMA_VARIANT=31b ./service.sh down
+GEMMA_VARIANT=31b ./service.sh up
+GEMMA_VARIANT=31b ./service.sh restart
 
 # Remove pod entirely
-./service.sh rm
+GEMMA_VARIANT=31b ./service.sh rm
 
 # Custom model path
-MODEL_PATH=/data/models/gemma-4-E2B-it ./service.sh up
+MODEL_PATH=/data/models/gemma-4-31B-it GEMMA_VARIANT=31b ./service.sh up
 ```
+
+Each variant creates its own pod (`gemma4-e2b`, `gemma4-26b`, `gemma4-31b`). Set `PORT` and `GPUS` to run multiple variants simultaneously on different ports and GPU sets. With 6x L40S GPUs, you can run 31B on GPUs 0-3 and 26B on GPUs 4-5 at the same time.
 
 ### Podman Kube Play
 
-Use the Kubernetes YAML for a declarative approach:
+Use the Kubernetes YAML for a declarative approach (E2B only):
 
 ```bash
 # Build the image
@@ -125,8 +124,9 @@ This YAML can also be deployed to Kubernetes with minimal changes (swap CDI anno
 ### Prepare (on a machine with internet)
 
 ```bash
-# 1. Download the model
-uv run python download-model.py
+# 1. Download the model(s) you need
+uv run python download-model.py e2b
+uv run python download-model.py 31b
 
 # 2. Build the container image
 podman build -t gemma4-vllm:latest .
@@ -139,7 +139,7 @@ tar -czf gemma4-model.tar.gz models/
 
 ### Deploy (on the air-gapped server)
 
-Transfer `gemma4-vllm.tar.gz`, `gemma4-model.tar.gz`, and `podman-compose.yml` (or `docker-compose.yml`) to the server.
+Transfer `gemma4-vllm.tar.gz`, `gemma4-model.tar.gz`, and `service.sh` (or compose files) to the server.
 
 ```bash
 # 1. Load the container image
@@ -149,18 +149,13 @@ podman load < gemma4-vllm.tar.gz
 # 2. Extract the model
 tar -xzf gemma4-model.tar.gz
 
-# 3. Run
-podman compose -f podman-compose.yml up
-# or: docker compose up
+# 3. Run (pick your variant)
+GEMMA_VARIANT=31b ./service.sh up
+# or for compose (E2B only):
+# podman compose -f podman-compose.yml up
 ```
 
-The compose files set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` to prevent any network calls.
-
-To use a custom model path:
-
-```bash
-MODEL_PATH=/data/models/gemma-4-E2B-it podman compose -f podman-compose.yml up
-```
+The service script and compose files set `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` to prevent any network calls.
 
 ## API Usage
 
@@ -173,8 +168,12 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
+# Use the served model name matching your GEMMA_VARIANT:
+#   e2b -> "gemma-4-E2B-it"
+#   26b -> "gemma-4-26B-A4B-it"
+#   31b -> "gemma-4-31B-it"
 response = client.chat.completions.create(
-    model="gemma-4-E2B-it",
+    model="gemma-4-31B-it",
     messages=[{"role": "user", "content": "What's the weather in Paris?"}],
     tools=[{
         "type": "function",
@@ -205,7 +204,8 @@ const vllm = createOpenAICompatible({
   baseURL: "http://localhost:8000/v1",
 });
 
-// Use vllm("gemma-4-E2B-it") as the model in your agent/generateText calls
+// Use the served model name matching your GEMMA_VARIANT
+// e.g. vllm("gemma-4-31B-it"), vllm("gemma-4-26B-A4B-it"), or vllm("gemma-4-E2B-it")
 ```
 
 ## Known Issues
@@ -216,11 +216,15 @@ When both `--reasoning-parser gemma4` and `--tool-call-parser gemma4` are set, v
 
 **Fix:** Do not use `--reasoning-parser gemma4`. The `serve.sh` and compose files already omit it.
 
-### Gemma 4 E4B does not fit on 12GB GPUs
+### GPU requirements by variant
 
-The E4B model (8B params) OOMs even at 4-bit quantization because bitsandbytes dequantizes weights to BF16 during forward passes, requiring ~10.8GB just for computation with no room for KV cache.
+| Variant | Min VRAM | Notes |
+|---------|----------|-------|
+| E2B | 12GB (1 GPU) | 4-bit quantized, fits on consumer GPUs |
+| 26B | 2x 48GB (tensor parallel) | MoE model, BF16, ~52GB weights + 256K KV cache |
+| 31B | 4x 48GB (tensor parallel) | Dense model, BF16, ~62GB weights + 256K KV cache (32 attn heads require tp divisible by 2/4/8) |
 
-Use E2B (5.1B params) instead, which fits comfortably at 4-bit (~7.2GB + 2.1GB KV cache).
+The E4B model (8B params) is not included as a variant — it OOMs on 12GB GPUs, and on larger GPUs the 26B/31B models are a better choice.
 
 ### transformers version
 
@@ -244,9 +248,9 @@ If running as root or with `podman-compose`, this is not needed.
 | `Dockerfile` | Extends vLLM image with transformers 5.x |
 | `docker-compose.yml` | Docker Compose setup (air-gap ready) |
 | `podman-compose.yml` | Podman Compose setup (air-gap ready) |
-| `service.sh` | Pod lifecycle manager (up/down/logs/status/test) |
-| `pod.sh` | Minimal pod launcher script |
-| `gemma4-pod.yml` | Kubernetes YAML for `podman kube play` |
-| `download-model.py` | Downloads model for offline use |
+| `service.sh` | Pod lifecycle manager (up/down/logs/status/test/download) — supports E2B, 26B, 31B |
+| `pod.sh` | Minimal pod launcher script (E2B) |
+| `gemma4-pod.yml` | Kubernetes YAML for `podman kube play` (E2B) |
+| `download-model.py` | Downloads model for offline use (accepts variant: e2b, 26b, 31b) |
 | `test_tool_call.py` | Tool calling smoke test |
 | `pyproject.toml` | Python dependencies (bare metal) |
