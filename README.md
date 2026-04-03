@@ -1,17 +1,19 @@
 # Gemma 4 with vLLM + Tool Calling
 
-Serve Google's Gemma 4 models with OpenAI-compatible tool calling. Supports three variants — from a single consumer GPU up to multi-GPU tensor-parallel setups.
+Serve Google's Gemma 4 models with OpenAI-compatible tool calling. Supports four variants — from a single consumer GPU up to multi-GPU tensor-parallel setups.
 
 ## Models
 
 | Variant | Model | Params | GPUs | Context | Quantization |
 |---------|-------|--------|------|---------|--------------|
 | `e2b` | [gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it) | 5.1B (2.3B effective) | 1 | 8K | bitsandbytes 4-bit |
-| `e4b` | [gemma-4-E4B-it-W4A16](https://huggingface.co/ciocan/gemma-4-E4B-it-W4A16) | 8B (4B effective) | 1 | 8K | GPTQ 4-bit (auto-round) |
+| `e4b` | [gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it) | 8B (4B effective) | 1 | 16K | bitsandbytes 4-bit |
 | `26b` | [gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) | 26B MoE (4B active) | 2 (tensor parallel) | 256K | none (BF16) |
 | `31b` | [gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) | 31B dense | 4 (tensor parallel) | 256K | none (BF16) |
 
 All models share: Apache 2.0 license, multimodal input (text, image, video), tool calling support via vLLM's `gemma4` parser.
+
+A GPTQ 4-bit quantized E4B variant ([ciocan/gemma-4-E4B-it-W4A16](https://huggingface.co/ciocan/gemma-4-E4B-it-W4A16)) is also available — see [QUANTIZE.md](QUANTIZE.md) for details on how it was created and how to use it.
 
 ## Quick Start (bare metal)
 
@@ -62,11 +64,16 @@ podman compose -f podman-compose.yml up --build
 
 ### Podman Pod (service script)
 
-`service.sh` manages the full pod lifecycle. Set `GEMMA_VARIANT` to choose the model (`e2b`, `26b`, or `31b`):
+`service.sh` manages the full pod lifecycle. Set `GEMMA_VARIANT` to choose the model:
 
 ```bash
 # Build the image (shared across all variants)
 ./service.sh build
+
+# --- Run E4B on a single 12GB GPU ---
+GEMMA_VARIANT=e4b ./service.sh download
+GEMMA_VARIANT=e4b ./service.sh up
+GEMMA_VARIANT=e4b ./service.sh test
 
 # --- Run the 31B model (most powerful, 4 GPUs) ---
 GEMMA_VARIANT=31b ./service.sh download
@@ -98,7 +105,7 @@ GEMMA_VARIANT=31b ./service.sh rm
 MODEL_PATH=/data/models/gemma-4-31B-it GEMMA_VARIANT=31b ./service.sh up
 ```
 
-Each variant creates its own pod (`gemma4-e2b`, `gemma4-26b`, `gemma4-31b`). Set `PORT` and `GPUS` to run multiple variants simultaneously on different ports and GPU sets. With 6x L40S GPUs, you can run 31B on GPUs 0-3 and 26B on GPUs 4-5 at the same time.
+Each variant creates its own pod (`gemma4-e2b`, `gemma4-e4b`, `gemma4-26b`, `gemma4-31b`). Set `PORT` and `GPUS` to run multiple variants simultaneously on different ports and GPU sets. With 6x L40S GPUs, you can run 31B on GPUs 0-3 and 26B on GPUs 4-5 at the same time.
 
 ### Podman Kube Play
 
@@ -127,6 +134,7 @@ This YAML can also be deployed to Kubernetes with minimal changes (swap CDI anno
 ```bash
 # 1. Download the model(s) you need
 uv run python download-model.py e2b
+uv run python download-model.py e4b
 uv run python download-model.py 31b
 
 # 2. Build the container image
@@ -151,6 +159,7 @@ podman load < gemma4-vllm.tar.gz
 tar -xzf gemma4-model.tar.gz
 
 # 3. Run (pick your variant)
+GEMMA_VARIANT=e4b ./service.sh up
 GEMMA_VARIANT=31b ./service.sh up
 # or for compose (E2B only):
 # podman compose -f podman-compose.yml up
@@ -171,10 +180,11 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
 # Use the served model name matching your GEMMA_VARIANT:
 #   e2b -> "gemma-4-E2B-it"
+#   e4b -> "gemma-4-E4B-it"
 #   26b -> "gemma-4-26B-A4B-it"
 #   31b -> "gemma-4-31B-it"
 response = client.chat.completions.create(
-    model="gemma-4-31B-it",
+    model="gemma-4-E4B-it",
     messages=[{"role": "user", "content": "What's the weather in Paris?"}],
     tools=[{
         "type": "function",
@@ -206,7 +216,7 @@ const vllm = createOpenAICompatible({
 });
 
 // Use the served model name matching your GEMMA_VARIANT
-// e.g. vllm("gemma-4-31B-it"), vllm("gemma-4-26B-A4B-it"), or vllm("gemma-4-E2B-it")
+// e.g. vllm("gemma-4-E4B-it"), vllm("gemma-4-31B-it"), vllm("gemma-4-E2B-it")
 ```
 
 ## Known Issues
@@ -215,18 +225,20 @@ const vllm = createOpenAICompatible({
 
 When both `--reasoning-parser gemma4` and `--tool-call-parser gemma4` are set, vLLM's streaming code path waits for reasoning (`<thought>` tags) to end before invoking the tool parser. If the model skips reasoning and goes straight to tool calls, the parser never activates and raw `<|tool_call>` tokens are returned as text content.
 
-**Fix:** Do not use `--reasoning-parser gemma4`. The `serve.sh` and compose files already omit it.
+**Fix:** Do not use `--reasoning-parser gemma4` when tool calling is needed. The E2B and E4B variants omit it. The 26B/31B variants include it for reasoning support.
+
+### E4B fits on 12GB with concurrency limits
+
+The E4B model (8B params) uses bitsandbytes 4-bit like E2B, but needs `--max-num-seq 16` to limit concurrent sequences and avoid OOM on 12GB GPUs. Without this flag, peak memory from bitsandbytes dequantization during forward passes can exceed 12GB under concurrent load.
 
 ### GPU requirements by variant
 
 | Variant | Min VRAM | Notes |
 |---------|----------|-------|
-| E2B | 12GB (1 GPU) | bitsandbytes 4-bit, fits on consumer GPUs |
-| E4B | 12GB (1 GPU) | GPTQ 4-bit (~9GB weights), fits on consumer GPUs |
-| 26B | 2x 48GB (tensor parallel) | MoE model, BF16, ~52GB weights + 256K KV cache |
-| 31B | 4x 48GB (tensor parallel) | Dense model, BF16, ~62GB weights + 256K KV cache (32 attn heads require tp divisible by 2/4/8) |
-
-The E4B model (8B params) is not included as a variant — it OOMs on 12GB GPUs, and on larger GPUs the 26B/31B models are a better choice.
+| E2B | 12GB (1 GPU) | bitsandbytes 4-bit, 8K context |
+| E4B | 12GB (1 GPU) | bitsandbytes 4-bit, 16K context, max 16 concurrent sequences |
+| 26B | 2x 48GB (tensor parallel) | MoE model, BF16, 256K context |
+| 31B | 4x 48GB (tensor parallel) | Dense model, BF16, 256K context |
 
 ### transformers version
 
@@ -250,9 +262,10 @@ If running as root or with `podman-compose`, this is not needed.
 | `Dockerfile` | Extends vLLM image with transformers 5.x |
 | `docker-compose.yml` | Docker Compose setup (air-gap ready) |
 | `podman-compose.yml` | Podman Compose setup (air-gap ready) |
-| `service.sh` | Pod lifecycle manager (up/down/logs/status/test/download) — supports E2B, 26B, 31B |
+| `service.sh` | Pod lifecycle manager (up/down/logs/status/test/download) — supports E2B, E4B, 26B, 31B |
 | `pod.sh` | Minimal pod launcher script (E2B) |
 | `gemma4-pod.yml` | Kubernetes YAML for `podman kube play` (E2B) |
-| `download-model.py` | Downloads model for offline use (accepts variant: e2b, 26b, 31b) |
+| `download-model.py` | Downloads model for offline use (accepts variant: e2b, e4b, 26b, 31b) |
 | `test_tool_call.py` | Tool calling smoke test |
 | `pyproject.toml` | Python dependencies (bare metal) |
+| `QUANTIZE.md` | Guide for creating GPTQ 4-bit quantization of E4B on L40S |

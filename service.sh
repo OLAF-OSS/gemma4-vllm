@@ -38,13 +38,21 @@ case "$GEMMA_VARIANT" in
     SHM_SIZE="16g"
     ;;
   e4b)
-    HF_MODEL="ciocan/gemma-4-E4B-it-W4A16"
+    # HF_MODEL="ciocan/gemma-4-E4B-it-W4A16"
+    # SERVED_NAME="gemma-4-E4B-it"
+    # MODEL_DIR="gemma-4-E4B-it-W4A16"
+    # TENSOR_PARALLEL=1
+    # QUANTIZATION_ARGS=(--quantization gptq_marlin)
+    # MAX_MODEL_LEN=16384
+    # EXTRA_ARGS=(--enforce-eager --max-num-seqs 16)
+    # SHM_SIZE=""
+    HF_MODEL="google/gemma-4-E4B-it"
     SERVED_NAME="gemma-4-E4B-it"
-    MODEL_DIR="gemma-4-E4B-it-W4A16"
+    MODEL_DIR="gemma-4-E4B-it"
     TENSOR_PARALLEL=1
-    QUANTIZATION_ARGS=(--quantization gptq)
-    MAX_MODEL_LEN=8192
-    EXTRA_ARGS=(--enforce-eager)
+    QUANTIZATION_ARGS=(--quantization bitsandbytes --load-format bitsandbytes)
+    MAX_MODEL_LEN=16384
+    EXTRA_ARGS=(--enforce-eager --max-num-seq 16)
     SHM_SIZE=""
     ;;
   *)
@@ -105,7 +113,7 @@ build_vllm_args() {
     --model /model
     --served-model-name "$SERVED_NAME"
     --max-model-len "$MAX_MODEL_LEN"
-    --gpu-memory-utilization 0.90
+    --gpu-memory-utilization 0.95
     --enable-auto-tool-choice
     --tool-call-parser gemma4
     --host 0.0.0.0
