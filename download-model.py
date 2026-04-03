@@ -6,6 +6,7 @@ from huggingface_hub import snapshot_download
 
 MODELS = {
     "e2b": "google/gemma-4-E2B-it",
+    "e4b": "ciocan/gemma-4-E4B-it-W4A16",
     "26b": "google/gemma-4-26B-A4B-it",
     "31b": "google/gemma-4-31B-it",
 }

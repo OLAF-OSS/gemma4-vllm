@@ -37,8 +37,18 @@ case "$GEMMA_VARIANT" in
     EXTRA_ARGS=(--reasoning-parser gemma4 --default-chat-template-kwargs '{"enable_thinking": true}')
     SHM_SIZE="16g"
     ;;
+  e4b)
+    HF_MODEL="ciocan/gemma-4-E4B-it-W4A16"
+    SERVED_NAME="gemma-4-E4B-it"
+    MODEL_DIR="gemma-4-E4B-it-W4A16"
+    TENSOR_PARALLEL=1
+    QUANTIZATION_ARGS=(--quantization gptq)
+    MAX_MODEL_LEN=8192
+    EXTRA_ARGS=(--enforce-eager)
+    SHM_SIZE=""
+    ;;
   *)
-    echo "Unknown variant '$GEMMA_VARIANT'. Use: e2b, 26b, 31b"
+    echo "Unknown variant '$GEMMA_VARIANT'. Use: e2b, e4b, 26b, 31b"
     exit 1
     ;;
 esac
@@ -287,7 +297,8 @@ usage() {
 Usage: GEMMA_VARIANT=<variant> $(basename "$0") <command>
 
 Variants:
-  e2b       Gemma 4 E2B  (5.1B params, 2.3B effective) — 1 GPU, 4-bit quantized
+  e2b       Gemma 4 E2B  (5.1B params, 2.3B effective) — 1 GPU, bitsandbytes 4-bit
+  e4b       Gemma 4 E4B  (8B params, 4B effective)   — 1 GPU, GPTQ 4-bit
   26b       Gemma 4 26B  (26B MoE, 4B active)           — 2 GPUs, tensor parallel, 256K context
   31b       Gemma 4 31B  (31B dense, most powerful)      — 4 GPUs, tensor parallel, 256K context
 

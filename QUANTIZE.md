@@ -1,63 +1,61 @@
-# Quantize Gemma 4 E4B to AWQ 4-bit
+# Quantize Gemma 4 E4B to GPTQ 4-bit
 
-Create an AWQ-quantized model that runs on a 12GB GPU (RTX 3080 Ti) with vLLM and tool calling.
+Create a GPTQ-quantized model that runs on a 12GB GPU (RTX 3080 Ti) with vLLM and tool calling.
 
-You only need **one L40 (48GB)** for this. The full BF16 model is ~16GB.
+Uses **auto-round** (RTN mode) inside the vLLM container for correct dependency versions.
 
-## On the L40 server
+You only need **one L40S (48GB)** for this. The full BF16 model is ~16GB.
 
-### 1. Set up the environment
+## On the L40S server
 
-```bash
-mkdir -p ~/gemma4-quant && cd ~/gemma4-quant
-
-# Create a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install autoawq transformers huggingface_hub
-```
-
-### 2. Log in to HuggingFace
-
-```bash
-pip install huggingface_hub
-huggingface-cli login
-# Paste your token when prompted
-```
-
-### 3. Run the quantization
+### 1. Prepare the quantization script
 
 Create `quantize.py`:
 
 ```python
-from awq import AutoAWQForCausalLM
-from transformers import AutoTokenizer
+"""Quantize Gemma 4 E4B to 4-bit using auto-round (GPTQ-compatible)."""
+
 import shutil
-from pathlib import Path
+from auto_round import AutoRound
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoProcessor
 from huggingface_hub import hf_hub_download
 
 MODEL_ID = "google/gemma-4-E4B-it"
-OUTPUT_DIR = "./gemma-4-E4B-it-AWQ"
-
-quant_config = {
-    "zero_point": True,
-    "q_group_size": 128,
-    "w_bit": 4,
-    "version": "GEMM",
-}
+OUTPUT_DIR = "./gemma-4-E4B-it-W4A16"
 
 print(f"Loading {MODEL_ID}...")
-model = AutoAWQForCausalLM.from_pretrained(MODEL_ID)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_ID, device_map="auto", torch_dtype="auto"
+)
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+processor = AutoProcessor.from_pretrained(MODEL_ID)
 
-print("Quantizing...")
-model.quantize(tokenizer, quant_config=quant_config)
+# Only quantize the language model layers, skip vision/audio towers
+layer_config = {}
+for name, _ in model.named_modules():
+    if name.startswith(("model.vision_tower", "model.audio_tower",
+                        "model.multi_modal_projector", "model.audio_projector")):
+        layer_config[name] = {"bits": 32}
 
-print(f"Saving to {OUTPUT_DIR}...")
-model.save_quantized(OUTPUT_DIR)
-tokenizer.save_pretrained(OUTPUT_DIR)
+print(f"Configuring auto-round 4-bit quantization (skipping {len(layer_config)} non-LM modules)...")
+autoround = AutoRound(
+    model,
+    tokenizer,
+    processor=processor,
+    bits=4,
+    group_size=128,
+    nsamples=256,
+    seqlen=2048,
+    iters=0,
+    disable_opt_rtn=True,
+    layer_config=layer_config,
+)
+
+print("Running quantization...")
+autoround.quantize()
+
+print(f"Saving to {OUTPUT_DIR} (auto_gptq format for vLLM)...")
+autoround.save_quantized(OUTPUT_DIR, format="auto_gptq")
 
 # Copy multimodal processor configs (required by vLLM)
 for filename in [
@@ -75,156 +73,154 @@ for filename in [
 print("Done.")
 ```
 
-Run it:
+### 2. Build the vLLM image (if not already built)
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python quantize.py
+./service.sh build
 ```
 
-This takes about 30-60 minutes on a single L40. You'll see progress per layer.
+### 3. Run the quantization inside the vLLM container
 
-### 4. Verify the output
+The vLLM container has the correct torch/transformers versions. We install auto-round into it at runtime:
 
 ```bash
-ls -lh gemma-4-E4B-it-AWQ/
+mkdir -p quantize-work
+
+# Copy the script
+cp quantize.py quantize-work/
+
+# Run on a single GPU (adjust --device to a free GPU)
+podman run --rm --entrypoint bash \
+  --device nvidia.com/gpu=4 \
+  --shm-size=16g \
+  -v ./quantize-work:/work:Z \
+  -e HF_HOME=/work/.cache \
+  -e CUDA_VISIBLE_DEVICES=0 \
+  -w /work \
+  localhost/gemma4-vllm:latest \
+  -c "
+pip install auto-round 2>/dev/null | tail -1
+python3 /work/quantize.py
+"
+```
+
+This takes about 5-10 minutes (RTN mode, no optimization iterations).
+
+### 4. Fix incompatible tensors
+
+The vLLM 0.19.0 Gemma4 loader doesn't expect `softcap` tensors saved by transformers 5.x. Remove them:
+
+```bash
+podman run --rm --entrypoint python3 \
+  -v ./quantize-work/gemma-4-E4B-it-W4A16:/model:Z \
+  localhost/gemma4-vllm:latest \
+  -c "
+import safetensors.torch as st
+import json, os
+
+model_dir = '/model'
+for fname in os.listdir(model_dir):
+    if not fname.endswith('.safetensors'):
+        continue
+    fpath = os.path.join(model_dir, fname)
+    tensors = st.load_file(fpath)
+    bad = [k for k in tensors if 'softcap' in k]
+    if bad:
+        print(f'{fname}: removing {len(bad)} softcap entries')
+        for k in bad:
+            del tensors[k]
+        st.save_file(tensors, fpath)
+    else:
+        print(f'{fname}: clean')
+
+idx_path = os.path.join(model_dir, 'model.safetensors.index.json')
+with open(idx_path) as f:
+    idx = json.load(f)
+removed = [k for k in idx['weight_map'] if 'softcap' in k]
+for k in removed:
+    del idx['weight_map'][k]
+with open(idx_path, 'w') as f:
+    json.dump(idx, f, indent=2)
+print(f'Index: removed {len(removed)} entries. Done.')
+"
+```
+
+### 5. Verify the output
+
+```bash
+ls -lh quantize-work/gemma-4-E4B-it-W4A16/
 ```
 
 You should see:
 
 ```
-config.json                 # model config (will mention quant_config)
-model.safetensors           # quantized weights (~5GB)
-tokenizer.json              # tokenizer
-tokenizer_config.json       # tokenizer config
-preprocessor_config.json    # vision processor (needed by vLLM)
-processor_config.json       # processor config (needed by vLLM)
-chat_template.jinja         # chat template
+config.json                       # model config (includes quant_config)
+model-00001-of-00002.safetensors  # quantized weights (~5.3GB)
+model-00002-of-00002.safetensors  # quantized weights (~4.2GB)
+model.safetensors.index.json      # weight index
+tokenizer.json                    # tokenizer
+tokenizer_config.json             # tokenizer config
+processor_config.json             # processor config (needed by vLLM)
+chat_template.jinja               # chat template
+quantization_config.json          # quantization metadata
 ```
 
-Total size should be around **5-6GB** (down from ~16GB BF16).
+Total size: ~9.5GB (language model 4-bit, vision/audio towers full precision).
+Model loading in vLLM: ~9.65 GiB VRAM — fits on a 12GB GPU.
 
-### 5. Quick smoke test on the L40
+### 6. Quick smoke test on the L40S
 
 ```bash
-pip install vllm
+# Copy to models dir
+cp -r quantize-work/gemma-4-E4B-it-W4A16 models/
 
-vllm serve ./gemma-4-E4B-it-AWQ \
-  --quantization awq \
-  --max-model-len 4096 \
-  --enable-auto-tool-choice \
-  --tool-call-parser gemma4 \
-  --port 8000 &
+# Start
+GEMMA_VARIANT=e4b GPUS=5 PORT=8003 ./service.sh up
 
-# Wait ~30s for startup, then test
-sleep 30
+# Test tool calling
+GEMMA_VARIANT=e4b PORT=8003 ./service.sh test
 
-curl -s http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemma-4-E4B-it-AWQ",
-    "messages": [{"role": "user", "content": "Extract PII: John Smith, SSN 123-45-6789"}],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "piiRedactTool",
-        "description": "Redact PII from text",
-        "parameters": {
-          "type": "object",
-          "properties": {"prompt": {"type": "string"}},
-          "required": ["prompt"]
-        }
-      }
-    }],
-    "tool_choice": "auto"
-  }' | python3 -m json.tool
-
-# Look for "tool_calls" in the response, not raw <|tool_call> tokens
-# Kill the test server
-kill %1
+# Stop
+GEMMA_VARIANT=e4b ./service.sh rm
 ```
 
-### 6. Upload to HuggingFace
-
-Create a model card `gemma-4-E4B-it-AWQ/README.md`:
-
-```markdown
----
-base_model: google/gemma-4-E4B-it
-library_name: transformers
-tags:
-  - awq
-  - 4-bit
-  - gemma4
-  - vllm
-license: apache-2.0
----
-
-# Gemma 4 E4B IT — AWQ 4-bit
-
-AWQ 4-bit quantization of [google/gemma-4-E4B-it](https://huggingface.co/google/gemma-4-E4B-it).
-
-Fits in 12GB VRAM (RTX 3080 Ti, RTX 4070, etc.)
-
-## Serving with vLLM
-
-\```bash
-vllm serve YOUR_USERNAME/gemma-4-E4B-it-AWQ \
-  --quantization awq \
-  --max-model-len 8192 \
-  --enforce-eager \
-  --enable-auto-tool-choice \
-  --tool-call-parser gemma4
-\```
-
-## Quantization details
-
-- **Method:** AWQ (AutoAWQ)
-- **Bits:** 4
-- **Group size:** 128
-- **Zero point:** True
-- **Kernel:** GEMM
-```
-
-Upload:
+### 7. Upload to HuggingFace
 
 ```bash
-# Replace YOUR_USERNAME with your HuggingFace username
-huggingface-cli upload YOUR_USERNAME/gemma-4-E4B-it-AWQ ./gemma-4-E4B-it-AWQ
+hf upload YOUR_USERNAME/gemma-4-E4B-it-W4A16 quantize-work/gemma-4-E4B-it-W4A16
 ```
 
-The repo will be created automatically at `https://huggingface.co/YOUR_USERNAME/gemma-4-E4B-it-AWQ`.
+If uploads time out through a proxy, upload files one at a time via Python:
 
-### 7. Package for transfer (air-gapped alternative)
+```python
+import httpx
+_orig = httpx.Client.__init__
+def _patch(self, *a, **kw):
+    kw['timeout'] = httpx.Timeout(600.0, connect=60.0)
+    _orig(self, *a, **kw)
+httpx.Client.__init__ = _patch
 
-If you can't use HuggingFace (air-gapped target server), tar it instead:
+from huggingface_hub import HfApi
+import os
 
-```bash
-tar -czf gemma-4-E4B-it-AWQ.tar.gz gemma-4-E4B-it-AWQ/
+api = HfApi()
+folder = "quantize-work/gemma-4-E4B-it-W4A16"
+repo = "YOUR_USERNAME/gemma-4-E4B-it-W4A16"
+
+api.create_repo(repo, repo_type="model", exist_ok=True)
+for f in sorted(os.listdir(folder), key=lambda f: os.path.getsize(os.path.join(folder, f))):
+    fpath = os.path.join(folder, f)
+    print(f"Uploading {f} ({os.path.getsize(fpath)/1e6:.1f} MB)...")
+    api.upload_file(path_or_fileobj=fpath, path_in_repo=f, repo_id=repo, repo_type="model")
+    print(f"  Done: {f}")
 ```
 
-The archive will be ~5GB. Transfer it to your workstation.
+## On the 3080 Ti workstation
 
-## On your workstation (RTX 3080 Ti)
-
-### 8. Get the model
-
-**From HuggingFace** (if uploaded in step 6):
+### 8. Download the model
 
 ```bash
-cd ~/projects/gemma4
-uv run python -c "
-from huggingface_hub import snapshot_download
-snapshot_download('YOUR_USERNAME/gemma-4-E4B-it-AWQ',
-                  local_dir='./models/gemma-4-E4B-it-AWQ',
-                  local_dir_use_symlinks=False)
-"
-```
-
-**From tar** (if packaged in step 7):
-
-```bash
-cd ~/projects/gemma4
-tar -xzf gemma-4-E4B-it-AWQ.tar.gz -C models/
+hf download YOUR_USERNAME/gemma-4-E4B-it-W4A16 --local-dir ./models/gemma-4-E4B-it-W4A16
 ```
 
 ### 9. Build the container image (if not already built)
@@ -233,78 +229,30 @@ tar -xzf gemma-4-E4B-it-AWQ.tar.gz -C models/
 ./service.sh build
 ```
 
-### 10. Add E4B-AWQ variant to service.sh
-
-Add a new case to the `GEMMA_VARIANT` block in `service.sh`:
+### 10. Run
 
 ```bash
-  e4b-awq)
-    HF_MODEL="YOUR_USERNAME/gemma-4-E4B-it-AWQ"
-    SERVED_NAME="gemma-4-E4B-it"
-    MODEL_DIR="gemma-4-E4B-it-AWQ"
-    TENSOR_PARALLEL=1
-    QUANTIZATION_ARGS=(--quantization awq)
-    MAX_MODEL_LEN=8192
-    EXTRA_ARGS=(--enforce-eager)
-    SHM_SIZE=""
-    ;;
+GEMMA_VARIANT=e4b ./service.sh up
+GEMMA_VARIANT=e4b ./service.sh test
+GEMMA_VARIANT=e4b ./service.sh status
 ```
 
-Then run:
+Expected VRAM: ~9.65 GiB model + KV cache — fits in 12GB.
 
-```bash
-GEMMA_VARIANT=e4b-awq ./service.sh up
-GEMMA_VARIANT=e4b-awq ./service.sh test
-GEMMA_VARIANT=e4b-awq ./service.sh status
-```
+## Why not AutoAWQ or llm-compressor?
 
-Expected VRAM: ~5-6GB weights + ~4-5GB KV cache = fits in 12GB.
-
-### 11. Test streaming tool calls
-
-```bash
-curl -s http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemma-4-E4B-it",
-    "stream": true,
-    "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
-    "tools": [{
-      "type": "function",
-      "function": {
-        "name": "get_weather",
-        "description": "Get weather",
-        "parameters": {
-          "type": "object",
-          "properties": {"location": {"type": "string"}},
-          "required": ["location"]
-        }
-      }
-    }],
-    "tool_choice": "auto"
-  }' | grep "tool_calls"
-```
-
-You should see streaming `tool_calls` deltas (not raw `<|tool_call>` tokens).
+- **AutoAWQ**: Deprecated and doesn't support the Gemma 4 architecture (`gemma4 isn't supported yet`).
+- **llm-compressor (GPTQ)**: Uses `torch.fx` tracing which fails on Gemma 4's multimodal architecture (`Proxy object cannot be iterated`).
+- **auto-round with optimization** (`iters>0`): Fails on Gemma 4's heterogeneous attention heads (256 vs 512 dimensions) during gradient computation.
+- **auto-round RTN** (`iters=0`): Works. Slightly lower quality than optimized GPTQ but avoids all architecture-specific issues.
 
 ## Troubleshooting
 
-**`OSError: Can't load feature extractor`**
-The quantized model is missing `preprocessor_config.json`. Copy it from the base model:
-```bash
-huggingface-cli download google/gemma-4-E4B-it preprocessor_config.json processor_config.json \
-  --local-dir models/gemma-4-E4B-it-AWQ/
-```
+**`ValueError: ... softcap ... no module or parameter`**
+The safetensors files contain `softcap` tensors from transformers 5.x that vLLM 0.19.0 doesn't expect. Run step 4 to remove them.
 
-**OOM on the L40 during quantization**
-Use a single GPU: `CUDA_VISIBLE_DEVICES=0 python quantize.py`
+**`ValueError: ... audio_tower ... g_idx`**
+The audio/vision tower layers were quantized. Re-run quantization with `layer_config` that sets those layers to `bits=32`.
 
 **OOM on the 3080 Ti during inference**
-Reduce context: `--max-model-len 4096` or `--max-model-len 2048`
-
-**`autoawq` doesn't support Gemma 4 architecture**
-AutoAWQ may need an update for the PLE architecture. If it fails, try GPTQ instead:
-```bash
-pip install auto-gptq optimum
-```
-Then use `quantize-gptq.py` from this repo (same steps, swap `--quantization awq` for `--quantization gptq` when serving).
+Reduce context: change `MAX_MODEL_LEN` to `4096` or `2048` in the `e4b` variant in `service.sh`.

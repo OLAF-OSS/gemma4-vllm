@@ -7,6 +7,7 @@ Serve Google's Gemma 4 models with OpenAI-compatible tool calling. Supports thre
 | Variant | Model | Params | GPUs | Context | Quantization |
 |---------|-------|--------|------|---------|--------------|
 | `e2b` | [gemma-4-E2B-it](https://huggingface.co/google/gemma-4-E2B-it) | 5.1B (2.3B effective) | 1 | 8K | bitsandbytes 4-bit |
+| `e4b` | [gemma-4-E4B-it-W4A16](https://huggingface.co/ciocan/gemma-4-E4B-it-W4A16) | 8B (4B effective) | 1 | 8K | GPTQ 4-bit (auto-round) |
 | `26b` | [gemma-4-26B-A4B-it](https://huggingface.co/google/gemma-4-26B-A4B-it) | 26B MoE (4B active) | 2 (tensor parallel) | 256K | none (BF16) |
 | `31b` | [gemma-4-31B-it](https://huggingface.co/google/gemma-4-31B-it) | 31B dense | 4 (tensor parallel) | 256K | none (BF16) |
 
@@ -220,7 +221,8 @@ When both `--reasoning-parser gemma4` and `--tool-call-parser gemma4` are set, v
 
 | Variant | Min VRAM | Notes |
 |---------|----------|-------|
-| E2B | 12GB (1 GPU) | 4-bit quantized, fits on consumer GPUs |
+| E2B | 12GB (1 GPU) | bitsandbytes 4-bit, fits on consumer GPUs |
+| E4B | 12GB (1 GPU) | GPTQ 4-bit (~9GB weights), fits on consumer GPUs |
 | 26B | 2x 48GB (tensor parallel) | MoE model, BF16, ~52GB weights + 256K KV cache |
 | 31B | 4x 48GB (tensor parallel) | Dense model, BF16, ~62GB weights + 256K KV cache (32 attn heads require tp divisible by 2/4/8) |
 
