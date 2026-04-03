@@ -1,0 +1,24 @@
+services:
+  vllm:
+    build: .
+    image: gemma4-vllm:latest
+    network_mode: host
+    volumes:
+      - ${MODEL_PATH:-./models/gemma-4-E2B-it}:/model:ro,Z
+    environment:
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+    ipc: host
+    devices:
+      - nvidia.com/gpu=all
+    command:
+      - --model=/model
+      - --served-model-name=gemma-4-E2B-it
+      - --quantization=bitsandbytes
+      - --load-format=bitsandbytes
+      - --max-model-len=8192
+      - --gpu-memory-utilization=0.90
+      - --enforce-eager
+      - --enable-auto-tool-choice
+      - --tool-call-parser=gemma4
+      - --port=8000

@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gemma4
+  annotations:
+    io.podman.annotations.cdi.devices: "nvidia.com/gpu=all"
+spec:
+  hostIPC: true
+  containers:
+    - name: vllm
+      image: localhost/gemma4-vllm:latest
+      ports:
+        - containerPort: 8000
+          hostPort: 8000
+          protocol: TCP
+      env:
+        - name: HF_HUB_OFFLINE
+          value: "1"
+        - name: TRANSFORMERS_OFFLINE
+          value: "1"
+      args:
+        - --model=/model
+        - --served-model-name=gemma-4-E2B-it
+        - --quantization=bitsandbytes
+        - --load-format=bitsandbytes
+        - --max-model-len=8192
+        - --gpu-memory-utilization=0.90
+        - --enforce-eager
+        - --enable-auto-tool-choice
+        - --tool-call-parser=gemma4
+        - --host=0.0.0.0
+        - --port=8000
+      volumeMounts:
+        - name: model
+          mountPath: /model
+          readOnly: true
+  volumes:
+    - name: model
+      hostPath:
+        path: ./models/gemma-4-E2B-it
+        type: Directory
